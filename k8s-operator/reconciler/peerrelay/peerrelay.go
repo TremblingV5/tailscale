@@ -451,7 +451,17 @@ func (r *Reconciler) ensureConfigSecret(ctx context.Context, logger *zap.Sugared
 		return err
 	}
 
-	desired, err := r.peerRelayConfigSecret(pr, idx, endpoint, authKey)
+	var loginServer string
+	if r.tsClients != nil {
+		tsClient, err := r.tsClients.For(pr.Spec.Tailnet)
+		if err != nil {
+			return fmt.Errorf("failed to resolve Tailscale API client for tailnet %q: %w", pr.Spec.Tailnet, err)
+		}
+
+		loginServer = tsClient.LoginURL()
+	}
+
+	desired, err := r.peerRelayConfigSecret(pr, idx, endpoint, authKey, loginServer)
 	if err != nil {
 		return fmt.Errorf("failed to build config Secret: %w", err)
 	}
