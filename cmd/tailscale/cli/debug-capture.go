@@ -24,12 +24,19 @@ func init() {
 func mkDebugCaptureCmd() *ffcli.Command {
 	return &ffcli.Command{
 		Name:       "capture",
-		ShortUsage: "tailscale debug capture",
+		ShortUsage: "tailscale debug capture [-o file] [-s snaplen]",
 		Exec:       runCapture,
 		ShortHelp:  "Stream pcaps for debugging",
 		FlagSet: (func() *flag.FlagSet {
 			fs := newFlagSet("capture")
 			fs.StringVar(&captureArgs.outFile, "o", "", "path to stream the pcap (or - for stdout), leave empty to start wireshark")
+			// -s/--snapshot-length caps the number of bytes captured from each
+			// packet, like tcpdump(1)'s -s flag. The default of 262144 matches
+			// tcpdump and is large enough to capture full packets; pass 0 for no
+			// limit. Both the short (-s) and long (--snapshot-length) spellings
+			// are accepted and are aliases for the same value.
+			fs.IntVar(&captureArgs.snaplen, "s", 262144, "snapshot length in bytes per packet, like tcpdump's -s (0 = unlimited)")
+			fs.IntVar(&captureArgs.snaplen, "snapshot-length", 262144, "alias for -s")
 			return fs
 		})(),
 	}
@@ -37,10 +44,11 @@ func mkDebugCaptureCmd() *ffcli.Command {
 
 var captureArgs struct {
 	outFile string
+	snaplen int
 }
 
 func runCapture(ctx context.Context, args []string) error {
-	stream, err := localClient.StreamDebugCapture(ctx)
+	stream, err := localClient.StreamDebugCapture(ctx, captureArgs.snaplen)
 	if err != nil {
 		return err
 	}

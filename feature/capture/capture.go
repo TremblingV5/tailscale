@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -40,6 +41,9 @@ func serveLocalAPIDebugCapture(h *localapi.Handler, w http.ResponseWriter, r *ht
 
 	b := h.LocalBackend()
 	s := b.GetOrSetCaptureSink(newSink)
+	if sink, ok := s.(*Sink); ok {
+		sink.setSnaplen(snaplenFromRequest(r))
+	}
 
 	unregister := s.RegisterOutput(w)
 
@@ -52,6 +56,20 @@ func serveLocalAPIDebugCapture(h *localapi.Handler, w http.ResponseWriter, r *ht
 	b.ClearCaptureSink()
 }
 
+// snaplenFromRequest parses the optional "snaplen" query parameter from the
+// capture request. A value of 0 (the default when the parameter is absent or
+// unparseable) means "no limit": the full packet is captured, preserving the
+// historical behaviour. A positive value caps the number of packet bytes
+// written per record, like tcpdump(1)'s -s flag.
+func snaplenFromRequest(r *http.Request) int {
+	if sl := r.URL.Query().Get("snaplen"); sl != "" {
+		if n, err := strconv.Atoi(sl); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
 var bufferPool = sync.Pool{
 	New: func() any {
 		return new(bytes.Buffer)
@@ -60,24 +78,32 @@ var bufferPool = sync.Pool{
 
 const flushPeriod = 100 * time.Millisecond
 
-func writePcapHeader(w io.Writer) {
+// pcapSnaplenUnlimited is the snapshot length advertised in the pcap global
+// header when no limit is requested. It is large enough to hold any packet
+// Tailscale handles, and matches the value historically written there.
+const pcapSnaplenUnlimited = 65535
+
+func writePcapHeader(w io.Writer, snaplen int) {
+	if snaplen <= 0 {
+		snaplen = pcapSnaplenUnlimited
+	}
 	binary.Write(w, binary.LittleEndian, uint32(0xA1B2C3D4)) // pcap magic number
 	binary.Write(w, binary.LittleEndian, uint16(2))          // version major
 	binary.Write(w, binary.LittleEndian, uint16(4))          // version minor
 	binary.Write(w, binary.LittleEndian, uint32(0))          // this zone
 	binary.Write(w, binary.LittleEndian, uint32(0))          // zone significant figures
-	binary.Write(w, binary.LittleEndian, uint32(65535))      // max packet len
+	binary.Write(w, binary.LittleEndian, uint32(snaplen))    // max packet len (snaplen)
 	binary.Write(w, binary.LittleEndian, uint32(147))        // link-layer ID - USER0
 }
 
-func writePktHeader(w *bytes.Buffer, when time.Time, length int) {
+func writePktHeader(w *bytes.Buffer, when time.Time, caplen, origlen int) {
 	s := when.Unix()
 	us := when.UnixMicro() - (s * 1000000)
 
-	binary.Write(w, binary.LittleEndian, uint32(s))      // timestamp in seconds
-	binary.Write(w, binary.LittleEndian, uint32(us))     // timestamp microseconds
-	binary.Write(w, binary.LittleEndian, uint32(length)) // length present
-	binary.Write(w, binary.LittleEndian, uint32(length)) // total length
+	binary.Write(w, binary.LittleEndian, uint32(s))       // timestamp in seconds
+	binary.Write(w, binary.LittleEndian, uint32(us))      // timestamp microseconds
+	binary.Write(w, binary.LittleEndian, uint32(caplen))  // captured length (incl_len)
+	binary.Write(w, binary.LittleEndian, uint32(origlen)) // original length (orig_len)
 }
 
 // newSink creates a new capture sink.
@@ -99,6 +125,16 @@ type Sink struct {
 	mu         sync.Mutex
 	outputs    set.HandleSet[io.Writer]
 	flushTimer *time.Timer // or nil if none running
+	snaplen    int         // max packet bytes to capture per record; 0 = unlimited
+}
+
+// setSnaplen sets the maximum number of packet bytes to capture per record.
+// A value of 0 or less means no limit (the full packet is captured). This is
+// a sink-wide setting: the snapshot length applies to every registered output.
+func (s *Sink) setSnaplen(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snaplen = n
 }
 
 // RegisterOutput connects an output to this sink, which
@@ -116,7 +152,14 @@ func (s *Sink) RegisterOutput(w io.Writer) (unregister func()) {
 	default:
 	}
 
-	writePcapHeader(w)
+	s.mu.Lock()
+	snaplen := s.snaplen
+	s.mu.Unlock()
+
+	// Write the pcap global header before this output is visible to
+	// LogPacket, so the header is always the first thing written.
+	writePcapHeader(w, snaplen)
+
 	s.mu.Lock()
 	hnd := s.outputs.Add(w)
 	s.mu.Unlock()
@@ -188,12 +231,29 @@ func (s *Sink) LogPacket(path packet.CapturePath, when time.Time, data []byte, m
 	}
 
 	extraLen := customDataLen(meta)
+
+	s.mu.Lock()
+	snaplen := s.snaplen
+	s.mu.Unlock()
+
+	// The snapshot length caps only the packet bytes, never the Tailscale
+	// metadata prefix (cutting into it would break the dissector). The pcap
+	// record header therefore reports the truncated length as the captured
+	// length and the true length as the original length, which is what makes
+	// tools like Wireshark mark truncated packets.
+	origLen := len(data) + extraLen
+	dataLen := len(data)
+	if snaplen > 0 && dataLen > snaplen {
+		dataLen = snaplen
+	}
+	capLen := dataLen + extraLen
+
 	b := bufferPool.Get().(*bytes.Buffer)
 	b.Reset()
-	b.Grow(16 + extraLen + len(data)) // 16b pcap header + len(metadata) + len(payload)
+	b.Grow(16 + extraLen + dataLen) // 16b pcap header + len(metadata) + len(payload)
 	defer bufferPool.Put(b)
 
-	writePktHeader(b, when, len(data)+extraLen)
+	writePktHeader(b, when, capLen, origLen)
 
 	// Custom tailscale debugging data
 	binary.Write(b, binary.LittleEndian, uint16(path))
@@ -210,7 +270,7 @@ func (s *Sink) LogPacket(path packet.CapturePath, when time.Time, data []byte, m
 		binary.Write(b, binary.LittleEndian, uint8(0)) // DNAT addr len == 0
 	}
 
-	b.Write(data)
+	b.Write(data[:dataLen])
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
